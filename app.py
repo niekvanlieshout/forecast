@@ -19,28 +19,30 @@ st.markdown(
     "De resultaten verschijnen in de Sheet-tab **`forecasts`** en zijn te bekijken in de Viewer."
 )
 
-# ---------- Secrets & constants ----------
-try:
-    sa_dict = dict(st.secrets["gcp_service_account"])  # hele service-account JSON
-    SHEET_ID = st.secrets["gcp_service_account"]["SHEET_ID"]  # je Google Sheet ID
-    # Optioneel: locatie in secrets, anders defaults
-    LAT = float(st.secrets["gcp_service_account"].get("LAT", 52.37))   # Amsterdam
-    LON = float(st.secrets["gcp_service_account"].get("LON", 4.90))
-except Exception:
-    st.error("Secrets ontbreken. Voeg gcp_service_account + SHEET_ID toe bij Streamlit → Settings → Secrets.")
-    st.stop()
+# === Secrets & credentials ===
+import json
+import streamlit as st
+import gspread
+from google.oauth2 import service_account
 
-HISTORY_TAB = "history"
-FORECASTS_TAB = "forecasts"
-NOW_TZ = "Europe/Amsterdam"
-HORIZON_DAYS = 7  # tot en met komende zondag (in praktijk: komende 7 dagen)
+# 1) lees de top-level secrets (zoals je ze in Streamlit hebt gezet)
+SHEET_ID = st.secrets["SHEET_ID"]
+TAB_HISTORY = st.secrets["TAB_HISTORY"]
+TAB_FORECASTS = st.secrets["TAB_FORECASTS"]
+LAT = float(st.secrets["LAT"])
+LON = float(st.secrets["LON"])
+
+# 2) service-account JSON uit secret "GCP_SERVICE_JSON"
+service_account_info = json.loads(st.secrets["GCP_SERVICE_JSON"])
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-creds = Credentials.from_service_account_info(sa_dict, scopes=SCOPES)
-gc = gspread.authorize(creds)
+credentials = service_account.Credentials.from_service_account_info(
+    service_account_info, scopes=SCOPES
+)
+gc = gspread.authorize(credentials)
 
 # ---------- Helpers ----------
 def _get_sheet():
