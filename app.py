@@ -133,6 +133,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def get_weather_range(lat: float, lon: float, start_date: str, end_date: str) -> pd.DataFrame:
+    """Haal dagelijks weer op bij Open-Meteo voor [start_date, end_date] (inclusief)."""
     url = (
         "https://api.open-meteo.com/v1/forecast?"
         f"latitude={lat}&longitude={lon}"
@@ -146,11 +147,18 @@ def get_weather_range(lat: float, lon: float, start_date: str, end_date: str) ->
     daily = j.get("daily", {})
     if not daily:
         return pd.DataFrame(columns=["date", "temp_c", "rain_mm"])
+
+    # Fix: maak eerst een Series zodat .dt werkt
+    s = pd.Series(daily["time"])
+    s = pd.to_datetime(s, errors="coerce").dt.tz_localize(None)  # → naïef
+    dates = s.dt.date.astype(str)
+
     w = pd.DataFrame({
-        "date": pd.to_datetime(daily["time"]).dt.tz_localize(None).dt.date.astype(str),
-        "temp_c": daily.get("temperature_2m_mean", [np.nan] * len(daily["time"])),
-        "rain_mm": daily.get("precipitation_sum", [np.nan] * len(daily["time"])),
+        "date": dates,
+        "temp_c": daily.get("temperature_2m_mean", [np.nan] * len(dates)),
+        "rain_mm": daily.get("precipitation_sum", [np.nan] * len(dates)),
     })
+    w = normalize_date_col(w, "date")
     return w
 
 def forecast_week(history: pd.DataFrame, lat: float, lon: float) -> pd.DataFrame:
