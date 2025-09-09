@@ -1,333 +1,275 @@
-# app.py – Upload & Forecast (voor baas)
+# app.py — Upload & Forecast (voor baas)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
 import json
-import gspread
-from google.oauth2 import service_account
-from lightgbm import LGBMRegressor
+import io
+import time
 from datetime import datetime, timedelta
 import pytz
 
-# -----------------------------
-# UI
-# -----------------------------
-st.set_page_config(page_title="Bakery Forecast – Upload & Run", page_icon="🍞", layout="wide")
-st.title("🍞 Bakery Forecast – Upload & Run")
-st.markdown(
-    "Deze pagina is voor **upload + forecast**. "
-    "De resultaten verschijnen in je Sheet-tab **`forecasts`** en zijn te bekijken in de Viewer."
-)
+import gspread
+from google.oauth2.service_account import Credentials
 
-# -----------------------------
-# Secrets & credentials
-# -----------------------------
-def _load_service_account_from_secrets():
+from lightgbm import LGBMRegressor
+from sklearn.metrics import mean_absolute_error
+
+
+# ---------- Page config ----------
+st.set_page_config(page_title="Bakery Forecast – Upload & Run", page_icon="🥖", layout="wide")
+st.title("🥖 Bakery Forecast – Upload & Run")
+st.write("Deze pagina is voor **upload + forecast**. De resultaten verschijnen in je Sheet-tab "
+         "**forecasts** en zijn te bekijken in de Viewer.")
+
+
+# ---------- Helpers: safe secrets (met fallback formulier) ----------
+def load_settings_from_secrets_or_form():
     """
-    Leest het service-account JSON uit Streamlit secrets.
-    Ondersteunt ofwel string met JSON (tussen triple quotes) of direct een dict.
+    Probeert eerst Streamlit Secrets te lezen. Als dat niet lukt of onvolledig is,
+    laat een formulier zien waarin je alles tijdelijk kunt invullen.
+    Retourneert dict: SHEET_ID, TAB_HISTORY, TAB_FORECASTS, LAT, LON, SA (service-account dict)
     """
-    if "GCP_SERVICE_JSON" in st.secrets:
-        raw = st.secrets["GCP_SERVICE_JSON"]
-    elif "gcp_service_account" in st.secrets:
-        raw = st.secrets["gcp_service_account"]
-    else:
-        raise KeyError("Service-account secret ontbreekt. Voeg 'GCP_SERVICE_JSON' toe bij Settings → Secrets.")
+    def _has_all(s):
+        need = {"SHEET_ID", "TAB_HISTORY", "TAB_FORECASTS", "LAT", "LON"}
+        has_needed = all(k in s for k in need)
+        has_json = ("GCP_SERVICE_JSON" in s) or ("gcp_service_account" in s)
+        return has_needed and has_json
 
-    if isinstance(raw, dict):
-        return raw
-    # anders string
-    txt = str(raw)
-    # Eventuele BOM/whitespace strippen
-    txt = txt.strip().lstrip("\ufeff")
-    return json.loads(txt)
+    # 1) probeer secrets
+    try:
+        if _has_all(st.secrets):
+            sheet_id = st.secrets["SHEET_ID"]
+            tab_hist = st.secrets["TAB_HISTORY"]
+            tab_fc = st.secrets["TAB_FORECASTS"]
+            lat = float(str(st.secrets["LAT"]))
+            lon = float(str(st.secrets["LON"]))
+            raw = st.secrets.get("GCP_SERVICE_JSON", st.secrets.get("gcp_service_account"))
+            sa = raw if isinstance(raw, dict) else json.loads(str(raw).strip().lstrip("\ufeff"))
+            st.caption("🔐 Secrets gevonden.")
+            return dict(SHEET_ID=sheet_id, TAB_HISTORY=tab_hist, TAB_FORECASTS=tab_fc,
+                        LAT=lat, LON=lon, SA=sa)
+        else:
+            st.info("Secrets onvolledig of ontbreken. Vul tijdelijk hieronder in.")
+    except Exception as e:
+        st.info(f"Secrets konden niet gebruikt worden ({e}). Vul tijdelijk hieronder in.")
 
-try:
-    SHEET_ID = st.secrets["SHEET_ID"]
-    HISTORY_TAB = st.secrets.get("TAB_HISTORY", "history")
-    FORECASTS_TAB = st.secrets.get("TAB_FORECASTS", "forecasts")
-    LAT = float(str(st.secrets.get("LAT", "51.44")))
-    LON = float(str(st.secrets.get("LON", "5.48")))
-    SA_INFO = _load_service_account_from_secrets()
-    SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
-              "https://www.googleapis.com/auth/drive"]
-except Exception as e:
-    st.error(
-        "❌ Secrets ontbreken. Voeg minimaal toe: `GCP_SERVICE_JSON`, `SHEET_ID`, "
-        "`TAB_HISTORY`, `TAB_FORECASTS`, `LAT`, `LON` (Settings → Secrets)."
-    )
-    st.stop()
+    # 2) fallback formulier (wordt niet opgeslagen)
+    with st.form("cfg"):
+        sheet_id = st.text_input("SHEET_ID (Google Sheet ID)")
+        tab_hist = st.text_input("TAB_HISTORY", "history")
+        tab_fc = st.text_input("TAB_FORECASTS", "forecasts")
+        c1, c2 = st.columns(2)
+        with c1:
+            lat = st.text_input("LAT", "51.44")
+        with c2:
+            lon = st.text_input("LON", "5.48")
+        sa_txt = st.text_area("Service Account JSON (volledige JSON, exact)", height=220,
+                              placeholder='{"type":"service_account", ...}')
+        go = st.form_submit_button("Doorgaan")
+    if not go:
+        st.stop()
+    try:
+        sa = json.loads(sa_txt.strip().lstrip("\ufeff"))
+    except Exception as e:
+        st.error(f"Service account JSON ongeldig: {e}")
+        st.stop()
+    return dict(SHEET_ID=sheet_id.strip(), TAB_HISTORY=tab_hist.strip(), TAB_FORECASTS=tab_fc.strip(),
+                LAT=float(lat), LON=float(lon), SA=sa)
 
-credentials = service_account.Credentials.from_service_account_info(SA_INFO, scopes=SCOPES)
+
+CFG = load_settings_from_secrets_or_form()
+
+# ---------- Google Sheets client ----------
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+credentials = Credentials.from_service_account_info(CFG["SA"], scopes=SCOPES)
 gc = gspread.authorize(credentials)
 
-# -----------------------------
-# Helpers Google Sheets
-# -----------------------------
-@st.cache_data(ttl=60)
-def _get_worksheet(sheet_id: str, tab_name: str):
-    sh = gc.open_by_key(sheet_id)
-    try:
-        ws = sh.worksheet(tab_name)
-    except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=tab_name, rows=2000, cols=20)
-    return ws
+def ws(sheet_id, tab_name):
+    return gc.open_by_key(sheet_id).worksheet(tab_name)
 
-def read_history() -> pd.DataFrame:
-    ws = _get_worksheet(SHEET_ID, HISTORY_TAB)
-    rows = ws.get_all_records()
-    if not rows:
-        return pd.DataFrame(columns=["date", "sku_id", "product_name", "sales", "temp_c", "rain_mm"])
-    df = pd.DataFrame(rows)
-    # kolomnamen netjes
+# ---------- Data I/O ----------
+def read_history():
+    sh = ws(CFG["SHEET_ID"], CFG["TAB_HISTORY"])
+    df = pd.DataFrame(sh.get_all_records())
+    if df.empty:
+        return pd.DataFrame(columns=["date", "sku_id", "product_name", "sales"])
+    # normaliseer
     df.columns = [c.strip() for c in df.columns]
-    # verplichte kolommen
-    for col in ["date", "sku_id", "product_name", "sales"]:
-        if col not in df.columns:
-            df[col] = np.nan
-    # types
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["sku_id"] = df["sku_id"].astype(str)
-    df["product_name"] = df["product_name"].astype(str)
-    df["sales"] = pd.to_numeric(df["sales"], errors="coerce")
-    # optioneel weer (als aanwezig)
-    if "temp_c" in df.columns:
-        df["temp_c"] = pd.to_numeric(df["temp_c"], errors="coerce")
-    else:
-        df["temp_c"] = np.nan
-    if "rain_mm" in df.columns:
-        df["rain_mm"] = pd.to_numeric(df["rain_mm"], errors="coerce")
-    else:
-        df["rain_mm"] = np.nan
-
-    df = df.dropna(subset=["date", "sku_id", "product_name", "sales"])
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values(["sku_id", "date"]).reset_index(drop=True)
     return df
 
-def write_forecasts(forecast_df: pd.DataFrame):
-    ws = _get_worksheet(SHEET_ID, FORECASTS_TAB)
-    ws.clear()
-    out = forecast_df.copy()
-    # strings die Google Sheets prettig vindt
-    out["date"] = out["date"].dt.strftime("%Y-%m-%d %H:%M:%S")
-    out["run_ts"] = out["run_ts"].dt.strftime("%Y-%m-%d %H:%M:%S%z")
-    rows = [out.columns.tolist()] + out.astype(str).values.tolist()
-    # batch update
-    ws.update("A1", rows, value_input_option="USER_ENTERED")
+def write_forecasts(forecast_df):
+    sh = ws(CFG["SHEET_ID"], CFG["TAB_FORECASTS"])
+    # leeg en schrijf opnieuw
+    sh.clear()
+    sh.update([forecast_df.columns.tolist()] + forecast_df.astype(str).values.tolist())
 
-# -----------------------------
-# Feature engineering
-# -----------------------------
-AMS = pytz.timezone("Europe/Amsterdam")
+def append_new_history(rows_df):
+    """Voegt nieuwe rijen toe aan history met dedupe (date, sku_id). Laatste win."""
+    if rows_df.empty:
+        return
+    hist = read_history()
+    combined = pd.concat([hist, rows_df], ignore_index=True)
+    combined = (combined
+        .sort_values(["sku_id", "date"])
+        .drop_duplicates(subset=["date", "sku_id"], keep="last"))
+    # overschrijf heel tab
+    sh = ws(CFG["SHEET_ID"], CFG["TAB_HISTORY"])
+    sh.clear()
+    # zorg voor kolomvolgorde
+    cols = ["date", "sku_id", "product_name", "sales"]
+    combined = combined[cols]
+    sh.update([combined.columns.tolist()] + combined.astype(str).values.tolist())
 
-def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.copy()
-    d["dow"] = d["date"].dt.dayofweek
-    d["is_weekend"] = (d["dow"] >= 5).astype(int)
-    # Fill weervelden als ze ontbreken
-    if "temp_c" not in d.columns:
-        d["temp_c"] = np.nan
-    if "rain_mm" not in d.columns:
-        d["rain_mm"] = np.nan
-    # Vullen met eenvoudige imputaties
-    d["temp_c"] = d.groupby("sku_id")["temp_c"].transform(lambda s: s.fillna(s.mean()))
-    d["rain_mm"] = d["rain_mm"].fillna(0.0)
-    return d
 
-def build_future_frame(skus: pd.DataFrame, horizon_dates: pd.DatetimeIndex,
-                       weather_future: pd.DataFrame) -> pd.DataFrame:
-    # alle (sku, date) combinaties
-    future = skus.assign(key=1).merge(pd.DataFrame({"date": horizon_dates, "key": 1}), on="key").drop("key", axis=1)
-    # features
-    future["dow"] = future["date"].dt.dayofweek
-    future["is_weekend"] = (future["dow"] >= 5).astype(int)
-    # weer toevoegen
-    future = future.merge(weather_future, on="date", how="left")
-    # als weer ontbreekt, 0/mean
-    future["temp_c"] = future["temp_c"].fillna(weather_future["temp_c"].mean())
-    future["rain_mm"] = future["rain_mm"].fillna(0.0)
-    return future
+# ---------- Feature engineering ----------
+def make_features(df):
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df["dow"] = df["date"].dt.dayofweek
+    df["is_weekend"] = (df["dow"] >= 5).astype(int)
+    # rolling per sku
+    df = df.sort_values(["sku_id", "date"])
+    df["sales_lag1"] = df.groupby("sku_id")["sales"].shift(1)
+    df["sales_ma7"] = df.groupby("sku_id")["sales"].shift(1).rolling(7).mean()
+    # vul missings
+    for c in ["sales_lag1", "sales_ma7"]:
+        df[c] = df[c].fillna(df[c].median())
+    # weer kolommen kunnen bestaan in history (optioneel)
+    for c in ["temp_c", "rain_mm"]:
+        if c not in df.columns:
+            df[c] = np.nan
+    return df
 
-# -----------------------------
-# Weer (Open-Meteo) – t/m komende zondag
-# -----------------------------
-def horizon_dates_to_sunday(now_tz=AMS) -> pd.DatetimeIndex:
-    today_local = datetime.now(tz=now_tz).date()
-    tomorrow = today_local + timedelta(days=1)
-    # tot komende zondag
-    days_ahead = (6 - datetime.fromordinal(tomorrow.toordinal()).weekday()) % 7
-    end = tomorrow + timedelta(days=days_ahead)
-    rng = pd.date_range(start=pd.Timestamp(tomorrow), end=pd.Timestamp(end), freq="D", tz=now_tz).normalize()
-    return rng
 
-@st.cache_data(ttl=1800)  # 30 minuten
-def get_weather_future(lat: float, lon: float, dates_index: pd.DatetimeIndex, tz=AMS) -> pd.DataFrame:
-    # Open-Meteo gebruikt start_date/end_date in ISO-formaat (zonder tijd)
-    start = dates_index.min().date().isoformat()
-    end = dates_index.max().date().isoformat()
-    url = (
-        "https://api.open-meteo.com/v1/forecast"
-        f"?latitude={lat}&longitude={lon}"
-        "&daily=temperature_2m_mean,precipitation_sum"
-        "&timezone=Europe%2FAmsterdam"
-        f"&start_date={start}&end_date={end}"
+# ---------- Weer (Open-Meteo) ----------
+def get_weather(lat, lon, dates, tz="Europe/Amsterdam"):
+    base = "https://api.open-meteo.com/v1/forecast"
+    params = dict(
+        latitude=lat, longitude=lon,
+        daily=["temperature_2m_mean","precipitation_sum"],
+        timezone=tz,
+        start_date=dates.min().date().isoformat(),
+        end_date=dates.max().date().isoformat(),
     )
-    r = requests.get(url, timeout=30)
+    r = requests.get(base, params=params, timeout=30)
     r.raise_for_status()
     j = r.json()
     daily = j["daily"]
     w = pd.DataFrame({
-        "date": pd.to_datetime(daily["time"]).dt.tz_localize("Europe/Amsterdam"),
+        "date": pd.to_datetime(daily["time"]),
         "temp_c": daily["temperature_2m_mean"],
         "rain_mm": daily["precipitation_sum"],
     })
     return w
 
-# -----------------------------
-# Model & voorspellen
-# -----------------------------
-FEATURES = ["dow", "is_weekend", "temp_c", "rain_mm"]
 
-def train_and_predict(history: pd.DataFrame, future_frame: pd.DataFrame) -> pd.DataFrame:
-    out_rows = []
-    run_ts = datetime.now(tz=AMS)
+# ---------- Train & forecast ----------
+def train_one_sku(hist_feat):
+    X = hist_feat[["dow","is_weekend","sales_lag1","sales_ma7","temp_c","rain_mm"]]
+    y = hist_feat["sales"]
+    # simpele, stabiele instellingen
+    model = LGBMRegressor(
+        n_estimators=200,
+        learning_rate=0.1,
+        max_depth=-1,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        random_state=42
+    )
+    model.fit(X, y)
+    return model
 
-    for sku, df_sku in history.groupby("sku_id", sort=False):
-        df_sku = df_sku.copy()
-        df_sku = add_basic_features(df_sku)
+def forecast_week(history_df, lat, lon, tz="Europe/Amsterdam"):
+    ams = pytz.timezone(tz)
+    today_local = pd.Timestamp.now(tz=ams).normalize()
+    tomorrow = today_local + pd.Timedelta(days=1)
+    horizon = pd.date_range(start=tomorrow, periods=7, freq="D")
 
-        # trainset (alle records met geldige sales)
-        train = df_sku.dropna(subset=["sales"]).copy()
-        if train.empty:
-            continue
+    # basisfeatures op historie
+    hist = history_df.copy()
+    hist["sales"] = hist["sales"].astype(float).clip(lower=0)
+    hist_feat = make_features(hist)
 
-        # eenvoudige validatie-indicatie (laatste 7 dagen als val)
-        # (optioneel; we trainen op alle data voor productievoorspelling)
-        X = train[FEATURES].fillna(0.0)
-        y = train["sales"].astype(float).clip(lower=0)
+    # weer voor horizon
+    weather = get_weather(lat, lon, horizon, tz=tz)
 
-        model = LGBMRegressor(
-            n_estimators=300,
-            learning_rate=0.05,
-            max_depth=-1,
-            subsample=0.9,
-            colsample_bytree=0.8,
-            random_state=42
-        )
-        model.fit(X, y)
+    # per sku trainen & voorspellen
+    rows = []
+    for sku, g in hist_feat.groupby("sku_id"):
+        # laatste bekende staat voor deze sku
+        last_row = g.sort_values("date").tail(1).iloc[0]
+        model = train_one_sku(g)
 
-        # toekomst voor deze sku
-        fsku = future_frame[future_frame["sku_id"] == sku].copy()
-        if fsku.empty:
-            continue
-        Xf = fsku[FEATURES].fillna(0.0)
+        # maak future frame
+        f = pd.DataFrame({"date": horizon})
+        f["sku_id"] = sku
+        f["product_name"] = g["product_name"].iloc[-1]
+        f["dow"] = f["date"].dt.dayofweek
+        f["is_weekend"] = (f["dow"] >= 5).astype(int)
+
+        # lags/rolling approx: gebruik laatste bekende waarden als start
+        f["sales_lag1"] = last_row["sales"]
+        f["sales_ma7"]  = g["sales"].tail(7).mean()
+
+        # join weer
+        f = f.merge(weather, on="date", how="left")
+        # safety in case weather missing
+        f["temp_c"] = f["temp_c"].fillna(f["temp_c"].median())
+        f["rain_mm"] = f["rain_mm"].fillna(0)
+
+        Xf = f[["dow","is_weekend","sales_lag1","sales_ma7","temp_c","rain_mm"]]
         yhat = model.predict(Xf)
-        yhat = np.maximum(yhat, 0)               # geen negatieve aantallen
-        yhat = np.rint(yhat).astype(int)         # afronden naar hele stuks
+        f["forecast_qty"] = np.round(np.clip(yhat, 0, None)).astype(int)
+        rows.append(f[["sku_id","product_name","date","forecast_qty"]])
 
-        fsku["forecast_qty"] = yhat
-        fsku["run_ts"] = run_ts
-        out_rows.append(fsku[["sku_id", "product_name", "date", "forecast_qty", "run_ts"]])
+    out = pd.concat(rows, ignore_index=True)
+    out["run_ts"] = pd.Timestamp.now(tz=pytz.timezone(tz))
+    return out
 
-    if not out_rows:
-        return pd.DataFrame(columns=["sku_id", "product_name", "date", "forecast_qty", "run_ts"])
 
-    res = pd.concat(out_rows, axis=0).sort_values(["date", "sku_id"]).reset_index(drop=True)
-    return res
-
-# -----------------------------
-# UI – Upload + Run
-# -----------------------------
-with st.sidebar:
-    st.subheader("📥 Upload nieuwe verkoopregels (CSV)")
-    st.caption("Minimaal kolommen: date, sku_id, product_name, sales. (opt: temp_c, rain_mm)")
-    uploaded = st.file_uploader("Kies CSV", type=["csv"])
-
-# Toon bestaande history (head)
-with st.expander("📚 Huidige history (eerste 20 rijen)"):
-    hist_now = read_history()
-    st.dataframe(hist_now.head(20), use_container_width=True)
-
-if uploaded is not None:
-    st.info("Nieuwe CSV ontvangen. Voeg toe aan history (de-dup op `(date, sku_id)`, laatste wint).")
-    new_df = pd.read_csv(uploaded)
-    # schoonmaken types
-    new_df.columns = [c.strip() for c in new_df.columns]
-    required = ["date", "sku_id", "product_name", "sales"]
-    missing = [c for c in required if c not in new_df.columns]
-    if missing:
-        st.error(f"CSV mist kolommen: {missing}")
+# ---------- UI: upload + run ----------
+st.subheader("1) Nieuwe verkoopregels uploaden (CSV, alleen nieuwe rijen)")
+up = st.file_uploader("CSV met kolommen: date, sku_id, product_name, sales", type=["csv"])
+if up is not None:
+    try:
+        new_df = pd.read_csv(up)
+        # schoonmaken
+        new_df.columns = [c.strip() for c in new_df.columns]
+        need = {"date","sku_id","product_name","sales"}
+        if not need.issubset(set(new_df.columns)):
+            st.error(f"CSV mist kolommen: {sorted(list(need - set(new_df.columns)))}")
+            st.stop()
+        new_df["date"] = pd.to_datetime(new_df["date"])
+        new_df["sales"] = pd.to_numeric(new_df["sales"], errors="coerce").fillna(0).clip(lower=0).astype(int)
+        append_new_history(new_df)
+        st.success(f"{len(new_df)} rijen toegevoegd (met dedupe).")
+    except Exception as e:
+        st.error(f"Upload mislukt: {e}")
         st.stop()
 
-    new_df["date"] = pd.to_datetime(new_df["date"], errors="coerce")
-    new_df["sku_id"] = new_df["sku_id"].astype(str)
-    new_df["product_name"] = new_df["product_name"].astype(str)
-    new_df["sales"] = pd.to_numeric(new_df["sales"], errors="coerce")
-    # optioneel
-    if "temp_c" in new_df.columns:
-        new_df["temp_c"] = pd.to_numeric(new_df["temp_c"], errors="coerce")
-    if "rain_mm" in new_df.columns:
-        new_df["rain_mm"] = pd.to_numeric(new_df["rain_mm"], errors="coerce")
-
-    new_df = new_df.dropna(subset=["date", "sku_id", "product_name", "sales"])
-    new_df = new_df.sort_values(["sku_id", "date"]).reset_index(drop=True)
-
-    # merge met bestaande history
-    hist = read_history()
-    merged = pd.concat([hist, new_df], axis=0, ignore_index=True)
-    # de-dup: laatste upload wint
-    merged = merged.sort_values(["date"]).drop_duplicates(subset=["date", "sku_id"], keep="last")
-    merged = merged.sort_values(["sku_id", "date"]).reset_index(drop=True)
-
-    # schrijf terug naar Sheet (history)
-    ws_hist = _get_worksheet(SHEET_ID, HISTORY_TAB)
-    ws_hist.clear()
-    tmp = merged.copy()
-    tmp["date"] = tmp["date"].dt.strftime("%Y-%m-%d %H:%M:%S")
-    rows = [tmp.columns.tolist()] + tmp.astype(str).values.tolist()
-    ws_hist.update("A1", rows, value_input_option="USER_ENTERED")
-
-    st.success(f"✅ History bijgewerkt: {len(new_df)} nieuwe rijen toegevoegd (na de-dup).")
-
-st.markdown("---")
-col1, col2 = st.columns([1, 2])
-with col1:
-    run_forecast = st.button("🚀 Forecast t/m komende zondag", type="primary")
-with col2:
-    st.caption("Gebruikt de volledige `history` + weersverwachting (Open-Meteo). Output gaat naar `forecasts`.")
-
-if run_forecast:
-    with st.spinner("Weer ophalen en modellen trainen…"):
+st.subheader("2) Forecast draaien")
+if st.button("Run forecast voor komende 7 dagen"):
+    with st.spinner("Bezig met trainen en voorspellen…"):
         hist = read_history()
         if hist.empty:
-            st.error("Geen history in Sheet. Upload eerst verkopen.")
+            st.error("History is leeg. Upload eerst data.")
             st.stop()
-        # set timezone netjes
-        hist["date"] = pd.to_datetime(hist["date"]).dt.tz_localize(AMS, nonexistent="shift_forward", ambiguous="NaT", errors="coerce")
-        hist = hist.dropna(subset=["date"])
+        # simpele validatie
+        if hist["sales"].dtype != int and hist["sales"].dtype != float:
+            hist["sales"] = pd.to_numeric(hist["sales"], errors="coerce").fillna(0)
 
-        # Skulijst voor toekomstframe
-        skus = hist[["sku_id", "product_name"]].drop_duplicates().sort_values("sku_id")
+        out = forecast_week(hist, CFG["LAT"], CFG["LON"], tz="Europe/Amsterdam")
+        # optioneel: mini-validatie
+        st.caption("✅ Geen negatieve aantallen, afronding op hele stuks.")
+        write_forecasts(out)
+        st.success("Voorspellingen geschreven naar tab **forecasts** in je Sheet.")
+        st.dataframe(out.head(20), use_container_width=True)
 
-        # horizon + weer
-        H = horizon_dates_to_sunday(AMS)
-        weather_f = get_weather_future(LAT, LON, H, tz=AMS)
-
-        future = build_future_frame(skus, H, weather_f)
-
-        # Train + predict
-        forecast_df = train_and_predict(hist, future)
-
-        if forecast_df.empty:
-            st.warning("Geen voorspellingen gegenereerd.")
-        else:
-            # schrijven naar Sheet
-            write_forecasts(forecast_df)
-            st.success(f"✅ Naar Sheet geschreven: {len(forecast_df)} regels → tab `{FORECASTS_TAB}`.")
-            st.dataframe(forecast_df.head(30), use_container_width=True)
-
-    # simpele kwaliteitschecks
-    if not forecast_df.empty:
-        neg = int((forecast_df["forecast_qty"] < 0).sum())
-        st.caption(f"Negatieve aantallen: {neg} (geclipped naar ≥ 0). Alles afgerond naar hele stuks.")
+st.caption("Tip: gebruik de **Viewer**-app om de resultaten (alleen-lezen) te bekijken of te downloaden.")
