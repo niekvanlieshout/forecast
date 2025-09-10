@@ -1,75 +1,87 @@
-# viewer.py — Alleen-lezen viewer
-import streamlit as st
-import pandas as pd
+# viewer.py — Read-only viewer voor medewerkers (laatste forecast)
 import json
+import pandas as pd
+import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Bakery Forecast – Viewer", page_icon="📈", layout="wide")
-st.title("📈 Bakery Forecast – Viewer")
-st.write("Read-only weergave van de laatste voorspellingen uit je Google Sheet.")
+st.title("📈 Bakery Forecast – Viewer (laatste 7 dagen vooruit)")
 
-# ---- Secrets of fallback mini-form ----
-def load_cfg():
-    def ok(s): 
-        need = {"SHEET_ID","TAB_FORECASTS"}
-        has_json = ("GCP_SERVICE_JSON" in s) or ("gcp_service_account" in s)
-        return all(k in s for k in need) and has_json
+# ==== Secrets check ====
+REQ = ["GCP_SERVICE_JSON", "SHEET_ID", "TAB_FORECASTS"]
+miss = [k for k in REQ if k not in st.secrets]
+if miss:
+    st.error("Secrets ontbreken: " + ", ".join(miss) + " (beheerder: vul in bij Settings → Secrets).")
+    st.stop()
 
-    if ok(st.secrets):
-        sheet_id = st.secrets["SHEET_ID"]
-        tab_fc = st.secrets["TAB_FORECASTS"]
-        raw = st.secrets.get("GCP_SERVICE_JSON", st.secrets.get("gcp_service_account"))
-        sa = raw if isinstance(raw, dict) else json.loads(str(raw).strip().lstrip("\ufeff"))
-        return sheet_id, tab_fc, sa
-
-    st.info("Secrets ontbreken. Vul tijdelijk hieronder in.")
-    sheet_id = st.text_input("SHEET_ID")
-    tab_fc = st.text_input("TAB_FORECASTS", "forecasts")
-    sa_txt = st.text_area("Service Account JSON", height=220)
-    if not st.button("Laden"):
-        st.stop()
-    sa = json.loads(sa_txt.strip().lstrip("\ufeff"))
-    return sheet_id, tab_fc, sa
-
-SHEET_ID, TAB_FC, SA = load_cfg()
+SERVICE_INFO  = json.loads(st.secrets["GCP_SERVICE_JSON"])
+SHEET_ID      = st.secrets["SHEET_ID"]
+FORECASTS_TAB = st.secrets["TAB_FORECASTS"]
 
 SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
 ]
-credentials = Credentials.from_service_account_info(SA, scopes=SCOPES)
-gc = gspread.authorize(credentials)
+creds = Credentials.from_service_account_info(SERVICE_INFO, scopes=SCOPES)
+gc = gspread.authorize(creds)
 
+# ==== Data inlezen ====
 def read_forecasts():
-    sh = gc.open_by_key(SHEET_ID).worksheet(TAB_FC)
-    df = pd.DataFrame(sh.get_all_records())
-    if df.empty:
+    sh = gc.open_by_key(SHEET_ID)
+    try:
+        ws = sh.worksheet(FORECASTS_TAB)
+    except gspread.WorksheetNotFound:
         return pd.DataFrame(columns=["sku_id","product_name","date","forecast_qty","run_ts"])
-    df["date"] = pd.to_datetime(df["date"])
-    df["run_ts"] = pd.to_datetime(df["run_ts"], errors="coerce")
-    df["forecast_qty"] = pd.to_numeric(df["forecast_qty"], errors="coerce").fillna(0).astype(int)
+    rows = ws.get_all_values()
+    if not rows:
+        return pd.DataFrame(columns=["sku_id","product_name","date","forecast_qty","run_ts"])
+    cols = [c.strip() for c in rows[0]]
+    df = pd.DataFrame(rows[1:], columns=cols)
+    # types
+    if "forecast_qty" in df.columns:
+        df["forecast_qty"] = pd.to_numeric(df["forecast_qty"], errors="coerce").fillna(0).astype(int)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=False)
+    if "run_ts" in df.columns:
+        # run_ts is string met offset, gewoon tonen
+        pass
     return df
 
 df = read_forecasts()
+
 if df.empty:
-    st.warning("Er zijn nog geen voorspellingen.")
+    st.info("Nog geen forecasts beschikbaar. Vraag je beheerder de upload/run-app te draaien.")
     st.stop()
 
-# Filters
-c1, c2 = st.columns(2)
-with c1:
-    prod = st.multiselect("Producten", sorted(df["product_name"].unique().tolist()))
-with c2:
-    dates = st.date_input("Datumrange", [df["date"].min().date(), df["date"].max().date()])
+# ==== Filters ====
+left, right = st.columns([2,1])
+with left:
+    unique_sku = ["(alle)"] + sorted(df["sku_id"].dropna().unique().tolist())
+    sku_sel = st.selectbox("Filter op artikel (SKU)", unique_sku, index=0)
+with right:
+    dl = st.download_button(
+        "Download CSV",
+        df.to_csv(index=False).encode("utf-8"),
+        file_name="forecasts_latest.csv",
+        mime="text/csv"
+    )
 
-f = df.copy()
-if prod:
-    f = f[f["product_name"].isin(prod)]
-if isinstance(dates, list) and len(dates) == 2:
-    start, end = pd.to_datetime(dates[0]), pd.to_datetime(dates[1]) + pd.Timedelta(days=1)
-    f = f[(f["date"] >= start) & (f["date"] < end)]
+if sku_sel != "(alle)":
+    df = df[df["sku_id"] == sku_sel]
 
-st.dataframe(f.sort_values(["date","product_name"]), use_container_width=True)
-st.download_button("Download CSV", data=f.to_csv(index=False).encode("utf-8"),
-                   file_name="forecasts.csv", mime="text/csv")
+# ==== Info over run ====
+run_info = df["run_ts"].iloc[0] if "run_ts" in df.columns and len(df) else "onbekend"
+st.caption(f"Laatste run: **{run_info}** (alleen komende 7 dagen).")
+
+# ==== Tabel + simpele pivot ====
+st.dataframe(
+    df.sort_values(["date","sku_id"]),
+    use_container_width=True,
+    hide_index=True
+)
+
+# Kleine dag-samenvatting (optioneel)
+if {"date","forecast_qty"}.issubset(df.columns):
+    day_sum = df.groupby("date", as_index=False)["forecast_qty"].sum()
+    st.bar_chart(day_sum.set_index("date")["forecast_qty"])
